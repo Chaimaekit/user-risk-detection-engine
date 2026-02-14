@@ -5,6 +5,8 @@ services:
     image: redpandadata/redpanda:latest
     command:
       - redpanda start
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://${{HOST_IP}}:9092
       - --overprovisioned
       - --smp 1
       - --memory 1G

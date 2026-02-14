@@ -1,0 +1,8 @@
+filebeat.inputs:
+- type: log
+  paths:
+    - /var/log/auth.log
+
+output.kafka:
+  hosts: ["${HOST_IP}:9092"]
+  topic: "raw-auth-logs"
