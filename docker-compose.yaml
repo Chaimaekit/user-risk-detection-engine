@@ -2,11 +2,12 @@ version: "3.8"
 
 services:
   redpanda:
-    image: redpandadata/redpanda:latest
+    image: redpandadata/redpanda:v23.3.11
+    container_name: redpanda-br
     command:
       - redpanda start
       - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr=PLAINTEXT://${{HOST_IP}}:9092
+      - --advertise-kafka-addr=PLAINTEXT://${HOST_IP}:9092
       - --overprovisioned
       - --smp 1
       - --memory 1G
@@ -16,18 +17,213 @@ services:
     ports:
       - "9092:9092"
       - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info --brokers localhost:9092 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 20s
+    restart: unless-stopped
 
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:24.3
+    container_name: clickhouse-ev
     ports:
       - "8123:8123"
       - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./storage/clickhouse/events.sql:/docker-entrypoint-initdb.d/events.sql:ro
+    environment:
+      - CLICKHOUSE_DB : riskdb
+      - CLICKHOUSE_USER : ${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD : ${CLICKHOUSE_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --host localhost --port 9000 --user ${CLICKHOUSE_USER} --password ${CLICKHOUSE_PASSWORD} --query 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
 
   postgres:
-    image: postgres:15
+    image: postgres:15-alpine
+    container_name: postgres-st
     environment:
-      POSTGRES_USER: risk
-      POSTGRES_PASSWORD: risk
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: riskdb
     ports:
       - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./storage/postgres/users.sql:/docker-entrypoint-initdb.d/users.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d riskdb -h localhost || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+redpanda-init:
+    image: redpandadata/redpanda:v23.3.11
+    container_name: rp-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      rpk topic create raw-auth-logs       --brokers redpanda:9092 --partitions 3
+      rpk topic create normalized-events   --brokers redpanda:9092 --partitions 3
+      rpk topic create enriched-events     --brokers redpanda:9092 --partitions 3
+      rpk topic create dead-letter-events  --brokers redpanda:9092 --partitions 1
+      echo 'Topics ready.'
+      "
+    restart: "no"
+
+normalizer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: normalizer
+    command: python -m processing.parser.normalize
+    env_file: .env
+    environment:
+      KAFKA_HOST: redpanda:9092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    login:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+enricher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: enricher
+    command: python -m processing.consumer
+    env_file: .env
+    environment:
+      KAFKA_HOST: redpanda:9092
+      REDIS_HOST: redis
+      CH_HOST: clickhouse
+      CH_USER: ${CLICKHOUSE_USER}
+      CH_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+scorer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: scorer
+    command: python -m scoring.scorer_consumer
+    env_file: .env
+    environment:
+      KAFKA_HOST: redpanda:9092
+      PG_HOST: postgres
+      PG_USER: ${POSTGRES_USER}
+      PG_PASSWORD: ${POSTGRES_PASSWORD}
+      PG_DB: riskdb
+      CH_HOST: clickhouse
+      CH_USER: ${CLICKHOUSE_USER}
+      CH_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+alerter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alerter
+    command: python -m alerting.siem_forwarder
+    env_file: .env
+    environment:
+      KAFKA_HOST: redpanda:9092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: simulator
+    command: python -m ingestion.logs_generator
+    env_file: .env
+    environment:
+      KAFKA_HOST: redpanda:9092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+    restart: "no"
+    profiles:
+      - simulation 
+
+volumes:
+  redpanda_data:
+  clickhouse_data:
+  postgres_data:
+  redis_data:
